@@ -126,20 +126,113 @@ func MultipartForm(formStruct interface{}, ifacePtr ...interface{}) martini.Hand
 func Json(jsonStruct interface{}, ifacePtr ...interface{}) martini.Handler {
 	return func(context martini.Context, req *http.Request) {
 		var errors Errors
+		var payload map[string]interface{}
+		var result reflect.Value
 
 		ensureNotPointer(jsonStruct)
 
-		jsonStruct := reflect.New(reflect.TypeOf(jsonStruct))
-
 		if req.Body != nil {
 			defer req.Body.Close()
-			err := json.NewDecoder(req.Body).Decode(jsonStruct.Interface())
+			err := json.NewDecoder(req.Body).Decode(&payload)
 			if err != nil && err != io.EOF {
 				errors.Add([]string{}, DeserializationError, err.Error())
 			}
 		}
 
-		validateAndMap(jsonStruct, context, errors, ifacePtr...)
+		result = fillStruct(reflect.TypeOf(jsonStruct), payload)
+
+		validateAndMap(result, context, errors, ifacePtr...)
+	}
+}
+
+// Creates struct with type 't', fills it with corresponding payloads, returns it
+func fillStruct(t reflect.Type, payload interface{}) reflect.Value {
+	result := reflect.New(t)
+
+	if result.Kind() == reflect.Ptr {
+		result = result.Elem()
+	}
+
+	for i := 0; i < t.NumField(); i++ {
+		var jsonTags []string
+
+		tfield := t.Field(i)
+
+		if tfield.Tag.Get("binding") == "-" {
+			continue
+		}
+
+		if !result.Field(i).CanSet() {
+			continue
+		}
+
+		if jsonTags = strings.Split(tfield.Tag.Get("json"), ","); jsonTags[0] == "" {
+			continue
+		}
+
+		value, found := jsonVal(jsonTags[0], payload)
+		if !found || value == nil {
+			result.Field(i).Set(reflect.Zero(tfield.Type))
+			continue
+		}
+
+		if tfield.Type.Kind() == reflect.Struct || tfield.Type.Kind() == reflect.Ptr {
+			r := fillStruct(tfield.Type, value)
+
+			if result.Field(i).Kind() == reflect.Ptr {
+				result.Field(i).Set(reflect.New(r.Type()))
+			} else {
+				result.Field(i).Set(r)
+			}
+		}
+
+		if tfield.Type.Kind() == reflect.Slice || tfield.Type.Kind() == reflect.Array {
+			result.Field(i).Set(fillSlice(tfield.Type, value))
+			continue
+		}
+
+		if reflect.ValueOf(value).Kind() == reflect.Map {
+			// Maps are not supported now
+			continue
+		}
+
+		if result.Field(i).CanSet() {
+			result.Field(i).Set(reflect.ValueOf(value))
+		}
+	}
+
+	return result
+}
+
+func fillSlice(t reflect.Type, payload interface{}) reflect.Value {
+	result := reflect.MakeSlice(t, 0, 0)
+
+	src, ok := payload.([]interface{})
+	if !ok {
+		return result
+	}
+
+	for _, value := range src {
+		if t.Elem().Kind() == reflect.Slice || t.Elem().Kind() == reflect.Array {
+			result = reflect.Append(result, fillSlice(t.Elem(), value))
+			continue
+		}
+
+		result = reflect.Append(result, fillStruct(t.Elem(), value))
+	}
+
+	return result
+}
+
+func jsonVal(name string, i interface{}) (interface{}, bool) {
+	if _, ok := i.(map[string]interface{}); !ok {
+		return nil, false
+	}
+
+	if v, ok := i.(map[string]interface{})[name]; !ok || v == nil {
+		return nil, false
+	} else {
+		return v, true
 	}
 }
 
@@ -357,9 +450,14 @@ func validateAndMap(obj reflect.Value, context martini.Context, errors Errors, i
 	context.Invoke(Validate(obj.Interface()))
 	errors = append(errors, getErrors(context)...)
 	context.Map(errors)
-	context.Map(obj.Elem().Interface())
+
+	if obj.Kind() == reflect.Ptr {
+		obj = obj.Elem()
+	}
+
+	context.Map(obj.Interface())
 	if len(ifacePtr) > 0 {
-		context.MapTo(obj.Elem().Interface(), ifacePtr[0])
+		context.MapTo(obj.Interface(), ifacePtr[0])
 	}
 }
 
